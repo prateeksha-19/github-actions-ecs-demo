@@ -1,0 +1,16 @@
+# Local Terraform state, plans, and secrets — never commit these.
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored — commit it so provider
+# versions are pinned and reproducible across machines and CI.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc

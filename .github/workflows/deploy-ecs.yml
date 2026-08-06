@@ -1,0 +1,139 @@
+name: Build, Push & Deploy to ECS
+
+# Builds the server image once, pushes it to BOTH GitHub Container Registry
+# (GHCR / GitHub Packages) and Amazon ECR, then rolls it out to ECS Fargate.
+#
+# AWS auth is via OIDC — no long-lived AWS keys are stored. The role ARN and
+# resource names come from `terraform apply` outputs, set as repo Variables:
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, ECR_REPOSITORY,
+#   ECS_CLUSTER, ECS_SERVICE, ECS_TASK_FAMILY, CONTAINER_NAME
+# See deploy/README.md.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  # Never let two deploys of the same ref race each other onto the service.
+  group: deploy-ecs-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write # push to GHCR
+  id-token: write # request the OIDC token used to assume the AWS role
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}/transcriptionsuite-server
+
+jobs:
+  build-and-push:
+    name: Build image & push to GHCR + ECR
+    runs-on: ubuntu-latest
+    outputs:
+      ecr_image: ${{ steps.image-ref.outputs.ecr_image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build & push (GHCR + ECR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          # CPU-only build so first-boot bootstrap skips the multi-GB CUDA wheels.
+          build-args: |
+            PYTORCH_VARIANT=cpu
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Expose ECR image reference for the deploy job
+        id: image-ref
+        run: |
+          echo "ecr_image=${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to ECS Fargate
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Optional manual-approval gate: create a "production" environment in repo
+    # settings and add required reviewers. Remove this line to deploy unattended.
+    environment: production
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ vars.ECS_TASK_FAMILY }}" \
+            --query 'taskDefinition' \
+            --output json > task-definition-raw.json
+
+          # Strip read-only fields that describe-task-definition returns but
+          # register-task-definition rejects.
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition-raw.json > task-definition.json
+
+      - name: Render new image into task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.ecr_image }}
+
+      - name: Deploy to ECS & wait for stability
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true

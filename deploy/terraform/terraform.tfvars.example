@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars and adjust. All values have sensible defaults; the
+# ones most worth reviewing are below.
+
+aws_region   = "us-east-1"
+project_name = "transcriptionsuite"
+
+# Must match the GitHub repo running the workflow (owner/name).
+github_repo = "prateeksha-19/github-actions-demo"
+
+# Which workflow refs may assume the AWS deploy role. Defaults to main + tags.
+github_oidc_subjects = [
+  "repo:prateeksha-19/github-actions-demo:ref:refs/heads/main",
+  "repo:prateeksha-19/github-actions-demo:ref:refs/tags/*",
+]
+
+# Set to false ONLY if this AWS account already has a GitHub OIDC provider
+# (an account may have just one provider per URL).
+# create_oidc_provider = true
+
+# Fargate task sizing. CPU transcription is heavy; bump these if tasks OOM or lag.
+# task_cpu               = "2048"   # 2 vCPU
+# task_memory            = "8192"   # 8 GB
+# ephemeral_storage_gib  = 50
+
+# Persist /data (transcription results) across restarts. Strongly recommended.
+# enable_efs = true
